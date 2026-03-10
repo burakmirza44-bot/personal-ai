@@ -1,17 +1,20 @@
 # PERSONAL-AI: Video, Ses ve Model Öğrenme Teknik Raporu
 
 **Tarih:** 2026-03-10
-**Son Güncelleme:** 2026-03-10 (Feedback Loop Eklendi)
+**Son Güncelleme:** 2026-03-10 (Dashboard Eklendi)
 **Kapsam:** D:\personal-ai projesinde video işleme, ses analizi ve makine öğrenmesi altyapısının mevcut durumu, eksiklikler ve geliştirme önerileri.
 
 ---
 
-## ÖZET: FEEDBACK LOOP GÜÇLENDİRME TAMAMLANDI
+## ÖZET: DASHBOARD VE FEEDBACK LOOP GÜÇLENDİRME TAMAMLANDI
 
 ### Eklenen Yeni Modüller
 
 | Modül | Dosya | Açıklama |
 |-------|-------|----------|
+| **Dashboard Metrics** | `app/dashboard/metrics.py` | Sistem metrikleri dataclass'ları |
+| **Dashboard Collector** | `app/dashboard/collector.py` | Kapsamlı metrik toplama |
+| **Dashboard Renderer** | `app/dashboard/renderer.py` | Terminal dashboard görüntüleme |
 | **Audio/STT** | `app/audio/whisper_local.py` | Whisper local inference (GPU/CPU) |
 | **Audio Extraction** | `feedback/audio/audio_extractor.py` | FFmpeg ile video → audio |
 | **Transcript Aligner** | `feedback/audio/transcript_aligner.py` | Ses-frame senkronizasyonu |
@@ -32,7 +35,39 @@
 ```
 tests/test_feedback_loop.py - 19 tests PASSED
 tests/test_stt_pipeline.py - 7 tests PASSED
+tests/test_dashboard.py - 29 tests PASSED
 ```
+
+### Dashboard Özellikleri
+
+```bash
+# Kapsamlı sağlık durumu
+personal-ai status-dashboard
+
+# JSON çıktı
+personal-ai status-dashboard --json
+
+# Canlı yenileme (5 sn)
+personal-ai status-dashboard --refresh
+
+# Kompakt görünüm
+personal-ai status-dashboard --compact
+
+# JSON dosyaya kaydet
+personal-ai status-dashboard --output health.json
+```
+
+**Toplanan Metrikler:**
+- System Resources (CPU, Memory, Disk, GPU)
+- Memory Store (Long-term, Short-term)
+- Bridge Connectivity (TD, Houdini)
+- RAG Index (Chunks, Documents)
+- Execution History (Success rate)
+- Error Tracking (Recent errors, types)
+- Planning (Goals, Plans)
+- Knowledge (Success patterns)
+- Training (Examples, Models)
+- Feedback Loop (Iterations, Score trend)
 
 ---
 

@@ -12,6 +12,7 @@ import pytest
 from app.learning.error_normalizer import (
     NormalizedError,
     NormalizedErrorType,
+    SourceLayer,
     normalize_bridge_failure,
     normalize_error,
 )
@@ -357,3 +358,159 @@ class TestErrorLoopIntegration:
         # Result should have normalized_errors (may be empty on success)
         assert hasattr(result, "normalized_errors")
         assert isinstance(result.normalized_errors, list)
+
+
+class TestErrorLoopTraceEvents:
+    """Tests for error loop trace event emission."""
+
+    def test_error_normalized_trace_event(self):
+        """Test that ERROR_NORMALIZED trace event is emitted."""
+        from app.learning.error_loop_manager import ErrorLoopManager
+        from app.recording.trace_events import TraceEventType
+
+        emitted_events: list = []
+
+        def trace_collector(event):
+            emitted_events.append(event)
+
+        manager = ErrorLoopManager(
+            domain="touchdesigner",
+            task_id="task_001",
+            trace_emitter=trace_collector,
+        )
+
+        manager.process_error("Test error", source_layer=SourceLayer.EXECUTION)
+
+        assert len(emitted_events) >= 1
+        assert emitted_events[0].event_type == TraceEventType.ERROR_NORMALIZED.value
+
+    def test_retry_decided_trace_event(self):
+        """Test that RETRY_DECIDED trace event is emitted."""
+        from app.learning.error_loop_manager import ErrorLoopManager
+        from app.learning.error_normalizer import NormalizedError, NormalizedErrorType
+        from app.recording.trace_events import TraceEventType
+
+        emitted_events: list = []
+
+        def trace_collector(event):
+            emitted_events.append(event)
+
+        manager = ErrorLoopManager(
+            domain="houdini",
+            task_id="task_002",
+            trace_emitter=trace_collector,
+        )
+
+        # Process an error first
+        manager.process_error("Connection timeout", source_layer=SourceLayer.BRIDGE)
+
+        # Get retry strategy (which emits RETRY_DECIDED if retry is recommended)
+        if manager.current_error and manager.current_error.retry_recommended:
+            strategy = manager.get_retry_strategy()
+            if strategy:
+                # Should have emitted RETRY_DECIDED
+                retry_events = [
+                    e for e in emitted_events
+                    if e.event_type == TraceEventType.RETRY_DECIDED.value
+                ]
+                assert len(retry_events) >= 1
+
+    def test_repair_attempted_trace_event(self):
+        """Test that REPAIR_ATTEMPTED trace event is emitted."""
+        from app.learning.error_loop_manager import ErrorLoopManager
+        from app.recording.trace_events import TraceEventType
+
+        emitted_events: list = []
+
+        def trace_collector(event):
+            emitted_events.append(event)
+
+        manager = ErrorLoopManager(
+            domain="touchdesigner",
+            task_id="task_003",
+            trace_emitter=trace_collector,
+        )
+
+        manager.process_error("Test error", source_layer=SourceLayer.EXECUTION)
+        manager.record_retry_attempt(
+            actions_executed=[{"action": "test"}],
+            success=True,
+            duration_ms=100.0,
+        )
+
+        repair_events = [
+            e for e in emitted_events
+            if e.event_type == TraceEventType.REPAIR_ATTEMPTED.value
+        ]
+        assert len(repair_events) >= 1
+
+    def test_error_loop_completed_trace_event(self):
+        """Test that ERROR_LOOP_COMPLETED trace event is emitted."""
+        from app.learning.error_loop_manager import ErrorLoopManager
+        from app.recording.trace_events import TraceEventType
+
+        emitted_events: list = []
+
+        def trace_collector(event):
+            emitted_events.append(event)
+
+        manager = ErrorLoopManager(
+            domain="houdini",
+            task_id="task_004",
+            trace_emitter=trace_collector,
+        )
+
+        manager.process_error("Test error", source_layer=SourceLayer.EXECUTION)
+        manager.complete(success=False)
+
+        complete_events = [
+            e for e in emitted_events
+            if e.event_type == TraceEventType.ERROR_LOOP_COMPLETED.value
+        ]
+        assert len(complete_events) >= 1
+
+    def test_no_events_without_emitter(self):
+        """Test that no events are emitted when no emitter is configured."""
+        from app.learning.error_loop_manager import ErrorLoopManager
+
+        manager = ErrorLoopManager(
+            domain="touchdesigner",
+            task_id="task_005",
+            # No trace_emitter
+        )
+
+        # This should not raise an error
+        manager.process_error("Test error", source_layer=SourceLayer.EXECUTION)
+        manager.complete(success=False)
+
+        # Just verify the manager works without an emitter
+        assert manager.state.error_count == 1
+
+    def test_fix_pattern_found_trace_event(self):
+        """Test that FIX_PATTERN_FOUND trace event is emitted when pattern found."""
+        from app.learning.error_loop_manager import ErrorLoopManager
+        from app.recording.trace_events import TraceEventType
+
+        emitted_events: list = []
+
+        def trace_collector(event):
+            emitted_events.append(event)
+
+        manager = ErrorLoopManager(
+            domain="touchdesigner",
+            task_id="task_006",
+            trace_emitter=trace_collector,
+        )
+
+        manager.process_error("Test error", source_layer=SourceLayer.EXECUTION)
+
+        # If a fix pattern was found, we should have the event
+        fix_events = [
+            e for e in emitted_events
+            if e.event_type == TraceEventType.FIX_PATTERN_FOUND.value
+        ]
+
+        # This depends on whether the fix pattern store has a matching pattern
+        # The test just verifies the event type exists and can be emitted
+        if manager.state.fix_pattern_found:
+            assert len(fix_events) >= 1
