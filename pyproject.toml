@@ -43,9 +43,7 @@ dev = [
 
 [tool.pytest.ini_options]
 pythonpath = ["."]
-testpaths = ["tests"]
-# old_tests/ is ARCHIVE ONLY - excluded from normal discovery
-addopts = "--ignore=old_tests"
+testpaths = ["tests", "old_tests"]
 
 [tool.setuptools.packages.find]
 include = ["app*", "gui*"]

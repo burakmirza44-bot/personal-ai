@@ -328,20 +328,34 @@ def _format_learning_guidance(guidance) -> str:
     """Format learning guidance for prompt injection."""
     parts = []
 
-    if guidance.suggested_approaches:
+    # Support both dict and object access
+    suggested = guidance.get("success_hints", []) if isinstance(guidance, dict) else getattr(guidance, "suggested_approaches", [])
+    warnings = guidance.get("warnings", []) if isinstance(guidance, dict) else getattr(guidance, "warnings", [])
+    repairs = guidance.get("suggested_fixes", []) if isinstance(guidance, dict) else getattr(guidance, "repair_strategies", [])
+
+    if suggested:
         parts.append("Proven successful approaches:")
-        for approach in guidance.suggested_approaches[:3]:
-            parts.append(f"  - {approach[:150]}")
+        for approach in suggested[:3]:
+            if isinstance(approach, dict):
+                parts.append(f"  - {approach.get('description', str(approach))[:150]}")
+            else:
+                parts.append(f"  - {str(approach)[:150]}")
 
-    if guidance.warnings:
+    if warnings:
         parts.append("\nKnown issues to avoid:")
-        for warning in guidance.warnings[:3]:
-            parts.append(f"  - {warning[:150]}")
+        for warning in warnings[:3]:
+            if isinstance(warning, dict):
+                parts.append(f"  - {warning.get('error_message', str(warning))[:150]}")
+            else:
+                parts.append(f"  - {str(warning)[:150]}")
 
-    if guidance.repair_strategies:
+    if repairs:
         parts.append("\nRepair strategies if errors occur:")
-        for repair in guidance.repair_strategies[:2]:
-            parts.append(f"  - {repair.get('description', '')[:150]}")
+        for repair in repairs[:2]:
+            if isinstance(repair, dict):
+                parts.append(f"  - {repair.get('description', repair.get('fix_description', str(repair)))[:150]}")
+            else:
+                parts.append(f"  - {str(repair)[:150]}")
 
     return "\n".join(parts) if parts else ""
 
@@ -473,11 +487,11 @@ def run_task(
                 "success_patterns": runtime_memory.success_pattern_count,
                 "failure_patterns": runtime_memory.failure_pattern_count,
                 "domain": route.domain,
-                "guidance_applied": learning_guidance.patterns_applied,
+                "guidance_applied": len(learning_guidance.get("success_hints", [])) + len(learning_guidance.get("suggested_fixes", [])),
             })
 
         # Enrich prompt with learning guidance if available
-        if learning_guidance and learning_guidance.has_guidance:
+        if learning_guidance and learning_guidance.get("has_guidance"):
             guidance_text = _format_learning_guidance(learning_guidance)
             if guidance_text:
                 system = system + "\n\n" + guidance_text
@@ -569,8 +583,9 @@ def run_task(
     if runtime_memory:
         memory_metadata["memory_influence"] = get_memory_influence_summary(runtime_memory)
     if learning_guidance:
-        memory_metadata["learning_guidance"] = learning_guidance.to_dict()
-        memory_metadata["patterns_applied"] = learning_guidance.patterns_applied
+        # learning_guidance is already a dict
+        memory_metadata["learning_guidance"] = learning_guidance
+        memory_metadata["patterns_applied"] = len(learning_guidance.get("success_hints", [])) + len(learning_guidance.get("suggested_fixes", []))
 
     return TaskResult(
         query=query,

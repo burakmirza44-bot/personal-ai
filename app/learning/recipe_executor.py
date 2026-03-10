@@ -499,6 +499,7 @@ class TDBridgeExecutor(BridgeExecutor):
         host: str = "127.0.0.1",
         port: int = 9988,
         timeout_seconds: float = 5.0,
+        dry_run: bool = False,
     ):
         """Initialize TD bridge executor.
 
@@ -506,8 +507,22 @@ class TDBridgeExecutor(BridgeExecutor):
             host: Bridge server host (default: 127.0.0.1)
             port: Bridge server port (default: 9988 for TD)
             timeout_seconds: Connection timeout
+            dry_run: If True, simulate execution without bridge calls
         """
         super().__init__(host, port, timeout_seconds)
+        self.dry_run = dry_run
+        self._client = None
+
+    def _get_client(self):
+        """Lazy-initialize TDLiveClient."""
+        if self._client is None:
+            from app.domains.touchdesigner.td_live_client import TDLiveClient
+            self._client = TDLiveClient(
+                host=self.host,
+                port=self.port,
+                timeout_seconds=self.timeout_seconds,
+            )
+        return self._client
 
     def ping(self) -> bool:
         """Check if TouchDesigner bridge is available.
@@ -515,14 +530,12 @@ class TDBridgeExecutor(BridgeExecutor):
         Returns:
             True if bridge is responsive
         """
-        import socket
-
+        if self.dry_run:
+            return True
         try:
-            sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-            sock.settimeout(self.timeout_seconds)
-            result = sock.connect_ex((self.host, self.port))
-            sock.close()
-            return result == 0
+            client = self._get_client()
+            result = client.ping()
+            return result.get("status") == "ok" or result.get("ping") == "pong"
         except Exception:
             return False
 
@@ -530,20 +543,63 @@ class TDBridgeExecutor(BridgeExecutor):
         """Execute a command on TouchDesigner.
 
         Args:
-            command: Command name (e.g., "set_par", "run_script")
+            command: Command type (e.g., "create_node", "set_parameter")
             params: Command parameters
 
         Returns:
-            Result dictionary
+            Result dictionary with success, result_data, error
         """
-        # Placeholder for actual bridge communication
-        # Real implementation would use the TD live client
-        return {
-            "success": False,
-            "error": "Bridge communication not implemented",
-            "command": command,
-            "params": params or {},
-        }
+        params = params or {}
+
+        # Dry run mode - return mock success
+        if self.dry_run:
+            return {
+                "success": True,
+                "dry_run": True,
+                "command": command,
+                "params": params,
+                "message": f"Dry run: would execute {command}",
+            }
+
+        # Real bridge communication
+        try:
+            from app.domains.touchdesigner.td_live_protocol import (
+                TDLiveCommandRequest,
+                new_command_id,
+            )
+
+            client = self._get_client()
+
+            # Build command request
+            request = TDLiveCommandRequest(
+                command_id=new_command_id(),
+                command_type=command,
+                task_id=params.get("task_id", "unknown"),
+                target_network=params.get("target_network", "/project1"),
+                payload=params.get("payload", params),
+                safety_level=params.get("safety_level", "safe"),
+            )
+
+            # Send to bridge
+            response = client.send_command(request)
+
+            # Map response to result
+            return {
+                "success": response.status == "ok",
+                "command": command,
+                "command_id": response.command_id,
+                "result_data": response.result,
+                "message": response.message,
+                "error": None if response.status == "ok" else response.message,
+            }
+
+        except Exception as exc:
+            return {
+                "success": False,
+                "command": command,
+                "error": str(exc),
+                "error_type": type(exc).__name__,
+            }
 
     def execute_step(self, step: dict[str, Any]) -> dict[str, Any]:
         """Execute a recipe step on TouchDesigner.
@@ -557,8 +613,21 @@ class TDBridgeExecutor(BridgeExecutor):
         action = step.get("action", "")
         params = step.get("params", {})
 
-        # Map step actions to bridge commands
-        return self.execute(action, params)
+        # Merge step metadata into params
+        merged_params = {
+            **params,
+            "task_id": step.get("task_id", step.get("step_id", "unknown")),
+            "target_network": step.get("target_network", step.get("target", "/project1")),
+            "payload": {
+                **params.get("payload", {}),
+                "node_type": step.get("node_type", ""),
+                "node_path": step.get("node_path", ""),
+                "parameter": step.get("parameter", ""),
+                "value": step.get("value", ""),
+            },
+        }
+
+        return self.execute(action, merged_params)
 
 
 class HoudiniBridgeExecutor(BridgeExecutor):
@@ -572,6 +641,7 @@ class HoudiniBridgeExecutor(BridgeExecutor):
         host: str = "127.0.0.1",
         port: int = 9989,
         timeout_seconds: float = 5.0,
+        dry_run: bool = False,
     ):
         """Initialize Houdini bridge executor.
 
@@ -579,8 +649,22 @@ class HoudiniBridgeExecutor(BridgeExecutor):
             host: Bridge server host (default: 127.0.0.1)
             port: Bridge server port (default: 9989 for Houdini)
             timeout_seconds: Connection timeout
+            dry_run: If True, simulate execution without bridge calls
         """
         super().__init__(host, port, timeout_seconds)
+        self.dry_run = dry_run
+        self._client = None
+
+    def _get_client(self):
+        """Lazy-initialize HoudiniLiveClient."""
+        if self._client is None:
+            from app.domains.houdini.houdini_live_client import HoudiniLiveClient
+            self._client = HoudiniLiveClient(
+                host=self.host,
+                port=self.port,
+                timeout_seconds=self.timeout_seconds,
+            )
+        return self._client
 
     def ping(self) -> bool:
         """Check if Houdini bridge is available.
@@ -588,14 +672,12 @@ class HoudiniBridgeExecutor(BridgeExecutor):
         Returns:
             True if bridge is responsive
         """
-        import socket
-
+        if self.dry_run:
+            return True
         try:
-            sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-            sock.settimeout(self.timeout_seconds)
-            result = sock.connect_ex((self.host, self.port))
-            sock.close()
-            return result == 0
+            client = self._get_client()
+            result = client.ping()
+            return result.get("status") == "ok"
         except Exception:
             return False
 
@@ -603,20 +685,63 @@ class HoudiniBridgeExecutor(BridgeExecutor):
         """Execute a command on Houdini.
 
         Args:
-            command: Command name (e.g., "create_node", "set_parm")
+            command: Command type (e.g., "create_node", "set_parameter", "run_python")
             params: Command parameters
 
         Returns:
-            Result dictionary
+            Result dictionary with success, result_data, error
         """
-        # Placeholder for actual bridge communication
-        # Real implementation would use the Houdini live client
-        return {
-            "success": False,
-            "error": "Bridge communication not implemented",
-            "command": command,
-            "params": params or {},
-        }
+        params = params or {}
+
+        # Dry run mode - return mock success
+        if self.dry_run:
+            return {
+                "success": True,
+                "dry_run": True,
+                "command": command,
+                "params": params,
+                "message": f"Dry run: would execute {command} in Houdini",
+            }
+
+        # Real bridge communication
+        try:
+            from app.domains.houdini.houdini_live_protocol import (
+                HoudiniLiveCommandRequest,
+                new_houdini_command_id,
+            )
+
+            client = self._get_client()
+
+            # Build command request
+            request = HoudiniLiveCommandRequest(
+                command_id=new_houdini_command_id(),
+                command_type=command,
+                task_id=params.get("task_id", "unknown"),
+                target_context=params.get("target_context", "/obj"),
+                payload=params.get("payload", params),
+                safety_level=params.get("safety_level", "safe"),
+            )
+
+            # Send to bridge
+            response = client.send_command(request)
+
+            # Map response to result
+            return {
+                "success": response.status == "ok" or response.status == "succeeded",
+                "command": command,
+                "command_id": response.command_id,
+                "result_data": response.result,
+                "message": response.message,
+                "error": None if response.status in ("ok", "succeeded") else response.message,
+            }
+
+        except Exception as exc:
+            return {
+                "success": False,
+                "command": command,
+                "error": str(exc),
+                "error_type": type(exc).__name__,
+            }
 
     def execute_step(self, step: dict[str, Any]) -> dict[str, Any]:
         """Execute a recipe step on Houdini.
@@ -630,8 +755,21 @@ class HoudiniBridgeExecutor(BridgeExecutor):
         action = step.get("action", "")
         params = step.get("params", {})
 
-        # Map step actions to bridge commands
-        return self.execute(action, params)
+        # Merge step metadata into params
+        merged_params = {
+            **params,
+            "task_id": step.get("task_id", step.get("step_id", "unknown")),
+            "target_context": step.get("target_context", step.get("target", "/obj")),
+            "payload": {
+                **params.get("payload", {}),
+                "node_type": step.get("node_type", ""),
+                "node_path": step.get("node_path", ""),
+                "parameter": step.get("parameter", ""),
+                "value": step.get("value", ""),
+            },
+        }
+
+        return self.execute(action, merged_params)
 
 
 class RecipeExecutor:

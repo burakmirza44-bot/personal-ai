@@ -10,10 +10,10 @@ import socket
 import time
 from dataclasses import dataclass, field
 from datetime import datetime
-from typing import Any
+from typing import Any, TYPE_CHECKING
 
 from app.agent_core.backend_result import BridgeHealthResult
-from app.learning.error_normalizer import NormalizedError, NormalizedErrorType, normalize_bridge_failure
+from app.learning.error_normalizer import NormalizedError, NormalizedErrorType
 
 
 @dataclass(slots=True)

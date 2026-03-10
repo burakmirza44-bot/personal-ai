@@ -62,6 +62,8 @@ class NormalizedErrorType(str, Enum):
     NO_PROGRESS = "no_progress"
     REPEATED_NO_PROGRESS = "repeated_no_progress"
     VERIFICATION_FAILED = "verification_failed"
+    VERIFICATION_MISMATCH = "verification_mismatch"
+    AMBIGUOUS_STATE = "ambiguous_state"
 
     # Recipe errors
     RECIPE_INVALID = "recipe_invalid"
@@ -92,6 +94,8 @@ class NormalizedErrorType(str, Enum):
     PROVIDER_UNAVAILABLE = "provider_unavailable"
     PROVIDER_TIMEOUT = "provider_timeout"
     PROVIDER_EXECUTION_FAILED = "provider_execution_failed"
+    PROVIDER_POLICY_BLOCKED = "provider_policy_blocked"
+    NO_LOCAL_PROVIDER_AVAILABLE = "no_local_provider_available"
 
     # Video/Media processing errors
     VIDEO_LOAD_FAILED = "video_load_failed"
