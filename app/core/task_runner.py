@@ -25,6 +25,12 @@ from app.core.task_router import TaskRouter
 from app.core.token_budget import TokenBudget, build_default_token_budget
 from app.learning.error_memory import ErrorMemoryStore, build_default_error_memory_store
 from app.learning.success_patterns import SuccessPatternStore, build_default_success_pattern_store
+from app.learning.error_loop_manager import (
+    ErrorLoopManager,
+    ErrorLoopResult,
+    create_error_loop_manager,
+)
+from app.learning.error_normalizer import SourceLayer
 
 # Unified inference orchestrator (local-first default)
 from app.core.inference_orchestrator import (
@@ -66,6 +72,57 @@ def _record_session_event(event_type: str, payload: dict) -> None:
         logger.debug("Session recording skipped: %s", exc)
 
 
+def _process_error_through_loop(
+    error: str,
+    domain: str,
+    task_class: str,
+    provider: str,
+    error_category: str = "unknown",
+) -> tuple[ErrorLoopResult | None, ErrorLoopManager | None]:
+    """Process an error through the ErrorLoopManager.
+
+    Args:
+        error: Error message
+        domain: Execution domain
+        task_class: Task classification
+        provider: Provider that failed
+        error_category: Error category from inference result
+
+    Returns:
+        Tuple of (ErrorLoopResult, ErrorLoopManager) for further processing
+    """
+    try:
+        manager = create_error_loop_manager(
+            domain=domain,
+            task_id=task_class,
+            repo_root=_REPO,
+        )
+
+        result = manager.process_error(
+            raw_error=error,
+            source_layer=SourceLayer.PROVIDER if provider != "ollama" else SourceLayer.BACKEND,
+            context={
+                "provider": provider,
+                "error_category": error_category,
+                "task_class": task_class,
+            },
+        )
+
+        # Record error loop event to session
+        _record_session_event("error_loop_processed", {
+            "loop_id": result.loop_id,
+            "error_count": result.normalized_error_count,
+            "retry_recommended": not result.no_progress_detected,
+            "fix_pattern_found": result.fix_pattern_candidate_generated,
+        })
+
+        return result, manager
+
+    except Exception as exc:
+        logger.debug("Error loop processing skipped: %s", exc)
+        return None, None
+
+
 @dataclass(slots=True)
 class TaskResult:
     """Result of a routed inference call."""
@@ -89,6 +146,13 @@ class TaskResult:
     fallback_used: bool = False
     route_reason: str = ""
     provider_error_summary: str = ""
+    # Error loop metadata
+    error_loop_id: str = ""
+    error_loop_processed: bool = False
+    error_loop_status: str = ""
+    retry_recommended: bool = False
+    fix_pattern_found: bool = False
+    fix_pattern_id: str = ""
 
     @property
     def ok(self) -> bool:
@@ -527,11 +591,40 @@ def run_task(
 
     # Handle result
     if not result.success:
+        # Process error through error loop
+        error_loop_result, error_loop_manager = _process_error_through_loop(
+            error=result.error,
+            domain=route.domain,
+            task_class=task_class,
+            provider=result.selected_provider,
+            error_category=result.error_category.value if result.error_category else "unknown",
+        )
+
+        # Record error to memory
         _record_error_to_memory(
             err_mem, query, route.domain,
             result.error_category.value if result.error_category else "unknown",
             result.error, result.selected_provider, task_class,
         )
+
+        # Build error loop metadata
+        error_loop_metadata = {}
+        if error_loop_result:
+            error_loop_metadata = {
+                "error_loop_id": error_loop_result.loop_id,
+                "normalized_error_count": error_loop_result.normalized_error_count,
+                "no_progress_detected": error_loop_result.no_progress_detected,
+            }
+
+        # Look up fix pattern if available
+        fix_pattern_id = ""
+        fix_pattern_found = False
+        if error_loop_manager:
+            fix_pattern = error_loop_manager.get_fix_pattern()
+            if fix_pattern:
+                fix_pattern_id = fix_pattern.fix_pattern_id
+                fix_pattern_found = True
+
         return TaskResult(
             query=query,
             domain=route.domain,
@@ -542,7 +635,7 @@ def run_task(
             decision_reason=result.route_reason or "inference_failed",
             remote_allowed=result.is_remote_result,
             error=result.error,
-            metadata={"task_class": task_class, "memory_injected": True},
+            metadata={"task_class": task_class, "memory_injected": True, **error_loop_metadata},
             selected_provider=result.selected_provider,
             provider_strategy=result.provider_strategy,
             attempted_providers=result.attempted_providers,
@@ -550,6 +643,13 @@ def run_task(
             fallback_used=result.fallback_used,
             route_reason=result.route_reason,
             provider_error_summary=result.provider_error_summary,
+            # Error loop metadata
+            error_loop_id=error_loop_result.loop_id if error_loop_result else "",
+            error_loop_processed=error_loop_result is not None,
+            error_loop_status=error_loop_result.final_error_loop_status if error_loop_result else "",
+            retry_recommended=not error_loop_result.no_progress_detected if error_loop_result else False,
+            fix_pattern_found=fix_pattern_found,
+            fix_pattern_id=fix_pattern_id,
         )
 
     # Record success to memory
