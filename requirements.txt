@@ -1,0 +1,31 @@
+# Core dependencies: none (stdlib-only for base functionality)
+# Install with: pip install -e .
+
+# Optional automation dependencies (screenshot capture, desktop control)
+# Required for: screen-monitor, screen-observe, screen-act CLI commands
+# Install with: pip install -e ".[automation]"
+# mss>=9.0.0
+# numpy>=1.24.0
+# Pillow>=10.0.0
+# pyautogui>=0.9.54
+
+# Feedback Loop dependencies (optional - for speech-to-text and training)
+# Install with: pip install -e ".[feedback]"
+# Speech-to-text (Whisper local inference)
+# faster-whisper>=1.0.0
+
+# Audio processing
+# noisereduce>=3.0.0
+# soundfile>=0.12.0
+
+# Fine-tuning
+# peft>=0.7.0
+# datasets>=2.16.0
+
+# Visual comparison
+# scikit-image>=0.22.0
+# opencv-python>=4.9.0
+
+# Development/test dependencies
+# Install with: pip install -e ".[dev]"
+pytest>=8.0.0
