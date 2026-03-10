@@ -1,0 +1,52 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "nexus"
+version = "0.1.0"
+description = "Nexus - Local-first personal AI assistant system with TouchDesigner-first specialization"
+readme = "README.md"
+requires-python = ">=3.11"
+dependencies = []
+
+[project.optional-dependencies]
+automation = [
+    # Screenshot capture and desktop automation (optional)
+    # Required for: screen-monitor, screen-observe, screen-act CLI commands
+    "mss>=9.0.0",
+    "numpy>=1.24.0",
+    "Pillow>=10.0.0",
+    "pyautogui>=0.9.54",
+]
+ocr = [
+    # OCR text extraction from screenshots (optional, local-first)
+    # Tesseract is the preferred engine; EasyOCR is optional fallback
+    # Install Tesseract from: https://github.com/UB-Mannheim/tesseract/wiki
+    "pytesseract>=0.3.10",
+    "Pillow>=10.0.0",
+]
+easyocr = [
+    # Optional EasyOCR fallback (heavier dependency, downloads models)
+    "easyocr>=1.7.0",
+]
+gui = [
+    # PyQt6 GUI application (optional)
+    # Required for: gui/ module, desktop interface
+    "PyQt6>=6.6.0",
+    "PyQt6-Qt6>=6.6.0",
+    "PyQt6-sip>=13.6.0",
+]
+dev = [
+    "pytest>=8.0.0",
+]
+
+[tool.pytest.ini_options]
+pythonpath = ["."]
+testpaths = ["tests"]
+# old_tests/ is ARCHIVE ONLY - excluded from normal discovery
+addopts = "--ignore=old_tests"
+
+[tool.setuptools.packages.find]
+include = ["app*", "gui*"]
+exclude = ["data*", "memory*", "reports*", "resources*", "tests*", "scripts*"]
