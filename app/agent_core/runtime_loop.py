@@ -1,16 +1,38 @@
 """Integrated Runtime Loop Module.
 
 Provides unified runtime orchestration with integrated error handling,
-memory management, bridge health monitoring, and checkpoint/resume support.
+memory management, bridge health monitoring, checkpoint/resume support,
+and long-horizon planning integration.
 """
 
 from __future__ import annotations
 
+import logging
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
+from app.agent_core.agent_loop import (
+    AgentLoopMonitor,
+    ComplexityLevel,
+    LoopState,
+    PlanState,
+    build_replan_context,
+    build_subgoal_context,
+    estimate_complexity,
+    propose_for_subgoal,
+    should_trigger_replan,
+    should_use_long_horizon_plan,
+)
+from app.agent_core.long_horizon_plan import (
+    LongHorizonPlan,
+    PlanConstraints,
+    PlanStatus,
+    build_long_horizon_plan,
+)
+from app.agent_core.plan_tracker import PlanTracker, create_tracker
+from app.agent_core.subgoal_models import Subgoal, SubgoalStatus
 from app.core.bridge_health import BridgeHealthReport, check_bridge_health
 from app.core.checkpoint import Checkpoint, StepStatus
 from app.core.checkpoint_lifecycle import CheckpointLifecycle, CheckpointBoundaryDetector
@@ -38,6 +60,8 @@ from app.learning.recipe_rag_bridge import (
     build_recipe_knowledge_from_steps,
     build_rag_context_from_bundle,
 )
+
+logger = logging.getLogger(__name__)
 
 
 @dataclass
@@ -73,7 +97,7 @@ class RuntimeLoopResult:
     """Result of a runtime loop execution.
 
     Provides visibility into memory usage, bridge health, execution status,
-    and checkpoint/resume metadata.
+    checkpoint/resume metadata, and planning progress.
     """
 
     run_id: str = ""
@@ -88,6 +112,15 @@ class RuntimeLoopResult:
     steps: list[RuntimeLoopStep] = field(default_factory=list)
     retries_attempted: int = 0
     metadata: dict[str, Any] = field(default_factory=dict)
+
+    # Planning integration fields
+    plan_state: PlanState = field(default_factory=PlanState)
+    complexity_level: str = ""
+    planning_triggered: bool = False
+    replan_triggered: bool = False
+    replan_reason: str = ""
+    current_subgoal_id: str | None = None
+    subgoal_progress_pct: float = 0.0
 
     # Legacy fields for backward compatibility
     success: bool = False
@@ -155,6 +188,14 @@ class RuntimeLoopResult:
             "execution_time_ms": self.execution_time_ms,
             "domain": self.domain,
             "task_id": self.task_id,
+            # Planning integration
+            "plan_state": self.plan_state.to_dict(),
+            "complexity_level": self.complexity_level,
+            "planning_triggered": self.planning_triggered,
+            "replan_triggered": self.replan_triggered,
+            "replan_reason": self.replan_reason,
+            "current_subgoal_id": self.current_subgoal_id,
+            "subgoal_progress_pct": self.subgoal_progress_pct,
             # Enhanced memory reuse metadata
             "memory_influence_weight": self.memory_influence_weight,
             "retrieval_confidence": self.retrieval_confidence,
@@ -195,7 +236,7 @@ class RuntimeLoopResult:
 
 
 class IntegratedRuntimeLoop:
-    """Unified runtime loop with integrated error, memory, bridge, and checkpoint systems.
+    """Unified runtime loop with integrated error, memory, bridge, checkpoint, and planning systems.
 
     This class provides a single entry point for task execution that:
     1. Attempts to resume from checkpoint if available
@@ -205,6 +246,7 @@ class IntegratedRuntimeLoop:
     5. Normalizes all errors into the error loop
     6. Saves results to memory after execution
     7. Provides visibility into all systems via RuntimeLoopResult
+    8. Supports long-horizon planning with subgoal tracking
     """
 
     def __init__(
@@ -214,9 +256,11 @@ class IntegratedRuntimeLoop:
         enable_memory: bool = True,
         enable_bridge_health: bool = True,
         enable_checkpoints: bool = True,
+        enable_planning: bool = True,
         task_id: str = "",
         session_id: str = "",
         plan_id: str = "",
+        complexity_threshold: ComplexityLevel = ComplexityLevel.MODERATE,
     ):
         """Initialize the integrated runtime loop.
 
@@ -226,19 +270,23 @@ class IntegratedRuntimeLoop:
             enable_memory: Whether to enable memory retrieval/writeback
             enable_bridge_health: Whether to enable bridge health checks
             enable_checkpoints: Whether to enable checkpoint/resume
+            enable_planning: Whether to enable long-horizon planning
             task_id: Task ID for checkpoint tracking
             session_id: Session ID for checkpoint tracking
             plan_id: Plan ID for checkpoint tracking
+            complexity_threshold: Minimum complexity to trigger planning
         """
         self._domain = domain
         self._repo_root = repo_root
         self._enable_memory = enable_memory
         self._enable_bridge_health = enable_bridge_health
         self._enable_checkpoints = enable_checkpoints
+        self._enable_planning = enable_planning
         self._task_id = task_id
         self._session_id = session_id or f"session_{int(time.time())}"
         self._plan_id = plan_id
         self._error_memory: list[NormalizedError] = []
+        self._complexity_threshold = complexity_threshold
 
         # Initialize error loop manager
         self._error_loop_manager: ErrorLoopManager | None = None
@@ -257,6 +305,228 @@ class IntegratedRuntimeLoop:
                 repo_root=repo_root,
             )
             self._boundary_detector = CheckpointBoundaryDetector()
+
+        # Initialize planning systems
+        self._plan_state: PlanState = PlanState()
+        self._long_horizon_plan: LongHorizonPlan | None = None
+        self._plan_tracker: PlanTracker | None = None
+        self._loop_monitor: AgentLoopMonitor | None = None
+        self._consecutive_failures: int = 0
+
+    # ------------------------------------------------------------------
+    # Planning Integration
+    # ------------------------------------------------------------------
+
+    def bind_plan(self, plan: LongHorizonPlan) -> None:
+        """Bind a long-horizon plan to the runtime loop.
+
+        Args:
+            plan: LongHorizonPlan to bind
+        """
+        self._long_horizon_plan = plan
+        self._plan_tracker = create_tracker(plan)
+        self._plan_state.bind_plan(plan, self._plan_tracker)
+        self._plan_id = plan.plan_id
+
+        # Initialize monitor for this run
+        self._loop_monitor = AgentLoopMonitor(
+            run_id=plan.plan_id,
+            domain=self._domain,
+        )
+
+        logger.info(f"Bound plan {plan.plan_id} with {len(plan.subgoals)} subgoals")
+
+    def create_plan_for_goal(
+        self,
+        goal: str,
+        task_id: str = "",
+        constraints: PlanConstraints | None = None,
+    ) -> LongHorizonPlan | None:
+        """Create a long-horizon plan for a goal if complexity warrants it.
+
+        Args:
+            goal: Goal description
+            task_id: Task ID for the plan
+            constraints: Optional plan constraints
+
+        Returns:
+            LongHorizonPlan if planning triggered, None otherwise
+        """
+        if not self._enable_planning:
+            return None
+
+        # Check if planning should be triggered
+        should_plan, complexity = should_use_long_horizon_plan(
+            goal=goal,
+            complexity_threshold=self._complexity_threshold,
+        )
+
+        if not should_plan:
+            logger.debug(f"Planning not triggered for complexity={complexity.value}")
+            return None
+
+        # Import subgoal decomposer
+        from app.agent_core.subgoal_decomposer import decompose_goal, DecompositionHints
+
+        # Create decomposition hints from constraints
+        hints = DecompositionHints(
+            max_subgoals=constraints.max_subgoals if constraints else 10,
+            step_budget_per_stage=constraints.max_steps_per_subgoal if constraints else 20,
+            retry_budget_per_stage=constraints.max_retries_per_subgoal if constraints else 3,
+        )
+
+        # Decompose goal into plan
+        plan = decompose_goal(
+            goal=goal,
+            domain=self._domain,
+            task_id=task_id or self._task_id,
+            hints=hints,
+        )
+
+        # Override constraints if provided
+        if constraints:
+            plan.constraints = constraints
+
+        # Bind the plan
+        self.bind_plan(plan)
+
+        logger.info(f"Created plan {plan.plan_id} for goal: {goal[:50]}...")
+        return plan
+
+    def get_current_subgoal(self) -> Subgoal | None:
+        """Get the current subgoal being executed.
+
+        Returns:
+            Current Subgoal or None if no plan bound
+        """
+        return self._plan_state.current_subgoal()
+
+    def advance_subgoal(self) -> bool:
+        """Advance to the next subgoal in the plan.
+
+        Returns:
+            True if advanced to next subgoal, False if plan complete
+        """
+        if not self._plan_state.has_plan:
+            return False
+
+        from_subgoal = self._plan_state.current_subgoal_id
+        advanced = self._plan_state.advance_subgoal()
+        to_subgoal = self._plan_state.current_subgoal_id
+
+        if advanced and self._loop_monitor:
+            self._loop_monitor.record_subgoal_transition(
+                from_subgoal=from_subgoal,
+                to_subgoal=to_subgoal,
+                reason="completed",
+            )
+            logger.info(
+                f"Advanced from {from_subgoal} to {to_subgoal} "
+                f"({self._plan_state.completed_subgoals}/{self._plan_state.total_subgoals})"
+            )
+
+        return advanced
+
+    def check_replan_needed(
+        self,
+        verification_result: str = "",
+        context: dict[str, Any] | None = None,
+    ) -> tuple[bool, str]:
+        """Check if replanning is needed based on current state.
+
+        Args:
+            verification_result: Result of last verification
+            context: Additional context for decision
+
+        Returns:
+            Tuple of (should_replan, reason)
+        """
+        if not self._plan_state.has_plan:
+            return False, ""
+
+        should_replan, reason = should_trigger_replan(
+            plan_state=self._plan_state,
+            verification_result=verification_result,
+            consecutive_failures=self._consecutive_failures,
+            context=context,
+        )
+
+        return should_replan, reason
+
+    def execute_replan(
+        self,
+        trigger_reason: str,
+        execution_history: list[RuntimeLoopStep] | None = None,
+    ) -> LongHorizonPlan | None:
+        """Execute a replan based on trigger reason.
+
+        Args:
+            trigger_reason: Why replan is needed
+            execution_history: Recent execution steps
+
+        Returns:
+            New LongHorizonPlan if successful, None otherwise
+        """
+        if not self._plan_state.can_replan():
+            logger.warning("Replan budget exhausted, cannot replan")
+            return None
+
+        # Record replan
+        self._plan_state.record_replan()
+        old_plan_id = self._plan_state.plan_id
+
+        # Build replan context
+        replan_ctx = build_replan_context(
+            plan_state=self._plan_state,
+            trigger_reason=trigger_reason,
+            execution_history=None,  # Will be converted if needed
+        )
+
+        logger.warning(f"Replanning due to: {trigger_reason}")
+
+        # Create new plan based on remaining work
+        # For now, we create a simplified plan focusing on failed/remaining subgoals
+        if self._long_horizon_plan:
+            remaining_goal = self._build_remaining_goal()
+            new_plan = self.create_plan_for_goal(
+                goal=remaining_goal,
+                task_id=f"{self._task_id}_replan_{self._plan_state.replan_count}",
+            )
+
+            if new_plan and self._loop_monitor:
+                self._loop_monitor.record_replan(
+                    trigger=trigger_reason,
+                    old_plan_id=old_plan_id,
+                    new_plan_id=new_plan.plan_id,
+                )
+
+            return new_plan
+
+        return None
+
+    def _build_remaining_goal(self) -> str:
+        """Build a goal description for remaining work.
+
+        Returns:
+            Goal string for remaining subgoals
+        """
+        if not self._long_horizon_plan:
+            return "Continue execution"
+
+        pending = self._plan_state.total_subgoals - self._plan_state.completed_subgoals
+        failed = self._plan_state.failed_subgoals
+
+        return f"Complete remaining {pending} subgoals ({failed} failed)"
+
+    @property
+    def plan_state(self) -> PlanState:
+        """Get the current plan state."""
+        return self._plan_state
+
+    @property
+    def loop_monitor(self) -> AgentLoopMonitor | None:
+        """Get the loop monitor."""
+        return self._loop_monitor
 
     def _get_error_loop_manager(self) -> ErrorLoopManager:
         """Get or create the error loop manager."""
@@ -583,11 +853,13 @@ class IntegratedRuntimeLoop:
         task_id: str = "",
         step_id: str | None = None,
     ) -> RuntimeLoopResult:
-        """Execute a single step with retry, error normalization, and checkpoint support.
+        """Execute a single step with retry, error normalization, checkpoint, and planning support.
 
         Routes execution to domain-specific bridge executors when available.
         For "touchdesigner" domain, uses TDBridgeExecutor for live bridge calls.
         For other domains, uses stub execution.
+
+        Integrates with PlanState for subgoal-aware execution when a plan is bound.
 
         Args:
             step: Step definition to execute
@@ -614,6 +886,37 @@ class IntegratedRuntimeLoop:
             result.resume_success = self._resume_result.success
             result.recovery_mode = self._resume_result.recovery_mode
             result.replayed_steps = self._resume_result.replayed_steps
+
+        # Planning integration: Get current subgoal context
+        current_subgoal = self.get_current_subgoal()
+        if current_subgoal:
+            result.current_subgoal_id = current_subgoal.subgoal_id
+            result.subgoal_progress_pct = self._plan_state.progress_pct()
+
+            # Build subgoal-aware context
+            subgoal_context = build_subgoal_context(
+                subgoal=current_subgoal,
+                plan_state=self._plan_state,
+                execution_context={"step": step, "task_id": task_id},
+            )
+            result.metadata["subgoal_context"] = subgoal_context
+
+            # Use subgoal-aware action selection if action not specified
+            if not step.get("action"):
+                action, _ = propose_for_subgoal(current_subgoal)
+                step = {**step, "action": action}
+
+            logger.debug(
+                f"Executing step for subgoal {current_subgoal.subgoal_id} "
+                f"({self._plan_state.completed_subgoals + 1}/{self._plan_state.total_subgoals})"
+            )
+
+        # Record step in monitor
+        if self._loop_monitor:
+            self._loop_monitor.record_step(
+                step_index=len(result.steps),
+                state=LoopState.EXECUTING,
+            )
 
         # Retrieve memory before execution
         query = step.get("description", step.get("action", ""))
@@ -689,6 +992,9 @@ class IntegratedRuntimeLoop:
 
                 result.execution_time_ms = (time.perf_counter() - start_time) * 1000
 
+                # Reset consecutive failures on success
+                self._consecutive_failures = 0
+
                 # Record recovery success if we had previous errors
                 if attempt > 0 and self._error_loop_manager and last_error:
                     self._error_loop_manager.record_recovery_success(
@@ -706,6 +1012,12 @@ class IntegratedRuntimeLoop:
                     )
                     self.save_checkpoint()
 
+                # Update plan state if we have a plan
+                if self._plan_state.has_plan and current_subgoal:
+                    self._plan_state.record_step(current_subgoal.subgoal_id)
+                    if verified:
+                        self._plan_state.last_verification_result = "passed"
+
                 # Save success to memory
                 if self._enable_memory:
                     save_execution_result(
@@ -716,6 +1028,7 @@ class IntegratedRuntimeLoop:
                             "description": f"Executed step: {step.get('action', 'unknown')}",
                             "attempts": attempt + 1,
                             "checkpoint_id": self._current_checkpoint.checkpoint_id if self._current_checkpoint else None,
+                            "subgoal_id": current_subgoal.subgoal_id if current_subgoal else None,
                         },
                         repo_root=self._repo_root,
                     )
@@ -725,10 +1038,16 @@ class IntegratedRuntimeLoop:
                 if self._error_loop_manager:
                     self._update_result_with_error_loop(result, error_loop_result)
 
+                # Update result with planning metadata
+                result.plan_state = self._plan_state
+                result.complexity_level = self._complexity_threshold.value
+                result.planning_triggered = self._plan_state.has_plan
+
                 return result
 
             except Exception as e:
                 last_error = e
+                self._consecutive_failures += 1
 
                 # Process error through ErrorLoopManager
                 if self._error_loop_manager:
@@ -741,6 +1060,7 @@ class IntegratedRuntimeLoop:
                             "attempt": attempt + 1,
                             "step": step,
                             "max_retries": max_retries,
+                            "subgoal_id": current_subgoal.subgoal_id if current_subgoal else None,
                         },
                     )
                     # Get normalized error for legacy tracking
@@ -757,6 +1077,7 @@ class IntegratedRuntimeLoop:
                             "task_id": task_id or self._task_id,
                             "attempt": attempt + 1,
                             "step": step,
+                            "subgoal_id": current_subgoal.subgoal_id if current_subgoal else None,
                         },
                     )
                     self._error_memory.append(normalized)
@@ -836,10 +1157,34 @@ class IntegratedRuntimeLoop:
             result.success = False
             result.execution_time_ms = (time.perf_counter() - start_time) * 1000
 
+            # Update plan state for failure
+            if self._plan_state.has_plan and current_subgoal:
+                self._plan_state.last_verification_result = "failed"
+                if self._plan_tracker:
+                    self._plan_tracker.fail_subgoal(
+                        current_subgoal.subgoal_id,
+                        error_ref=str(last_error)[:100],
+                        reason=f"Step failed after {max_retries} attempts",
+                    )
+                self._plan_state._sync_from_plan()
+
             # Complete error loop with failure
             if self._error_loop_manager:
                 error_loop_result = self._error_loop_manager.complete(success=False)
                 self._update_result_with_error_loop(result, error_loop_result)
+
+            # Check if replanning is needed
+            if self._plan_state.has_plan:
+                should_replan, replan_reason = self.check_replan_needed(
+                    verification_result="failed",
+                    context={"error": str(last_error)},
+                )
+                result.replan_triggered = should_replan
+                result.replan_reason = replan_reason
+
+                if should_replan:
+                    logger.warning(f"Replan triggered: {replan_reason}")
+                    # Note: Actual replanning happens at recipe/plan level
 
             # Save failure to memory
             if self._enable_memory:
@@ -853,10 +1198,17 @@ class IntegratedRuntimeLoop:
                         "attempts": max_retries,
                         "checkpoint_id": self._current_checkpoint.checkpoint_id if self._current_checkpoint else None,
                         "error_loop_id": result.error_loop_id,
+                        "subgoal_id": current_subgoal.subgoal_id if current_subgoal else None,
+                        "consecutive_failures": self._consecutive_failures,
                     },
                     repo_root=self._repo_root,
                 )
                 result.memory_writeback_done = True
+
+        # Update result with planning metadata
+        result.plan_state = self._plan_state
+        result.complexity_level = self._complexity_threshold.value
+        result.planning_triggered = self._plan_state.has_plan
 
         return result
 
