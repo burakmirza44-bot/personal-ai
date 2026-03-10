@@ -144,7 +144,7 @@ def normalize_bridge_error(
     report: BridgeHealthReport,
     domain: str,
     task_id: str = "",
-) -> NormalizedError:
+) -> "NormalizedError":
     """Convert a bridge health report to a normalized error.
 
     Args:
@@ -155,6 +155,9 @@ def normalize_bridge_error(
     Returns:
         NormalizedError with appropriate type and context
     """
+    # Lazy import to avoid circular dependency
+    from app.learning.error_normalizer import NormalizedError, NormalizedErrorType
+
     error_code = report.last_error_code
     failure_reason = report.last_error_message
 
